@@ -22,7 +22,7 @@ import yaml
 import pystache
 import requests
 
-from spilo_commons import RW_DIR, PATRONI_CONFIG_FILE, append_extentions,\
+from spilo_commons import RW_DIR, PATRONI_CONFIG_FILE, append_extensions,\
         get_binary_version, get_bin_dir, is_valid_pg_version, write_file, write_patroni_config
 
 
@@ -33,10 +33,9 @@ PROVIDER_LOCAL = "local"
 PROVIDER_UNSUPPORTED = "unsupported"
 USE_KUBERNETES = os.environ.get('KUBERNETES_SERVICE_HOST') is not None
 KUBERNETES_DEFAULT_LABELS = '{"application": "spilo"}'
-MEMORY_LIMIT_IN_BYTES_PATH = '/sys/fs/cgroup/memory/memory.limit_in_bytes'
-PATRONI_DCS = ('zookeeper', 'exhibitor', 'consul', 'etcd3', 'etcd')
+PATRONI_DCS = ('kubernetes', 'zookeeper', 'exhibitor', 'consul', 'etcd3', 'etcd')
 AUTO_ENABLE_WALG_RESTORE = ('WAL_S3_BUCKET', 'WALE_S3_PREFIX', 'WALG_S3_PREFIX', 'WALG_AZ_PREFIX', 'WALG_SSH_PREFIX')
-WALG_SSH_NAMES = ['WALG_SSH_PREFIX', 'SSH_PRIVATE_KEY_PATH', 'SSH_USERNAME']
+WALG_SSH_NAMES = ['WALG_SSH_PREFIX', 'SSH_PRIVATE_KEY_PATH', 'SSH_USERNAME', 'SSH_PORT']
 
 
 def parse_args():
@@ -70,14 +69,13 @@ def adjust_owner(resource, uid=None, gid=None):
 
 
 def link_runit_service(placeholders, name):
-    service_dir = os.path.join(placeholders['RW_DIR'], 'service', name)
+    rw_service = os.path.join(placeholders['RW_DIR'], 'service')
+    service_dir = os.path.join(rw_service, name)
     if not os.path.exists(service_dir):
-        os.makedirs(service_dir)
-        for f in ('run', 'finish'):
-            src_file = os.path.join('/etc/runit/runsvdir/default', name, f)
-            dst_file = os.path.join(service_dir, f)
-            if os.path.exists(src_file) and not os.path.exists(dst_file):
-                os.symlink(src_file, dst_file)
+        if not os.path.exists(rw_service):
+            os.makedirs(rw_service)
+        os.symlink(os.path.join('/etc/runit/runsvdir/default', name), service_dir)
+        os.makedirs(os.path.join(placeholders['RW_DIR'], 'supervise', name))
 
 
 def write_certificates(environment, overwrite):
@@ -181,7 +179,8 @@ bootstrap:
       {{/STANDBY_WITH_WALE}}
       - basebackup_fast_xlog
       {{#STANDBY_WITH_WALE}}
-      restore_command: envdir "{{STANDBY_WALE_ENV_DIR}}" /scripts/restore_command.sh "%f" "%p"
+      restore_command: envdir "{{STANDBY_WALE_ENV_DIR}}" timeout "{{WAL_RESTORE_TIMEOUT}}"
+        /scripts/restore_command.sh "%f" "%p"
       {{/STANDBY_WITH_WALE}}
       {{#STANDBY_HOST}}
       host: {{STANDBY_HOST}}
@@ -189,6 +188,9 @@ bootstrap:
       {{#STANDBY_PORT}}
       port: {{STANDBY_PORT}}
       {{/STANDBY_PORT}}
+      {{#STANDBY_PRIMARY_SLOT_NAME}}
+      primary_slot_name: {{STANDBY_PRIMARY_SLOT_NAME}}
+      {{/STANDBY_PRIMARY_SLOT_NAME}}
     {{/STANDBY_CLUSTER}}
     ttl: 30
     loop_wait: &loop_wait 10
@@ -229,8 +231,9 @@ bootstrap:
     command: envdir "{{CLONE_WALE_ENV_DIR}}" python3 /scripts/clone_with_wale.py
       --recovery-target-time="{{CLONE_TARGET_TIME}}"
     recovery_conf:
-        restore_command: envdir "{{CLONE_WALE_ENV_DIR}}" /scripts/restore_command.sh "%f" "%p"
-        recovery_target_timeline: latest
+        restore_command: envdir "{{CLONE_WALE_ENV_DIR}}" timeout "{{WAL_RESTORE_TIMEOUT}}"
+          /scripts/restore_command.sh "%f" "%p"
+        recovery_target_timeline: "{{CLONE_TARGET_TIMELINE}}"
         {{#USE_PAUSE_AT_RECOVERY_TARGET}}
         recovery_target_action: pause
         {{/USE_PAUSE_AT_RECOVERY_TARGET}}
@@ -306,8 +309,8 @@ postgresql:
     bg_mon.listen_address: '{{BGMON_LISTEN_IP}}'
     bg_mon.history_buckets: 120
     pg_stat_statements.track_utility: 'off'
-    extwlist.extensions: 'btree_gin,btree_gist,citext,hstore,intarray,\
-ltree,pgcrypto,pgq,pg_trgm,postgres_fdw,tablefunc,uuid-ossp,hypopg'
+    extwlist.extensions: 'btree_gin,btree_gist,citext,extra_window_functions,first_last_agg,hll,\
+hstore,hypopg,intarray,ltree,pgcrypto,pgq,pgq_node,pg_trgm,postgres_fdw,tablefunc,uuid-ossp'
     extwlist.custom_path: /scripts
   pg_hba:
     - local   all             all                                   trust
@@ -336,7 +339,8 @@ ltree,pgcrypto,pgq,pg_trgm,postgres_fdw,tablefunc,uuid-ossp,hypopg'
 
   {{#USE_WALE}}
   recovery_conf:
-    restore_command: envdir "{{WALE_ENV_DIR}}" /scripts/restore_command.sh "%f" "%p"
+    restore_command: envdir "{{WALE_ENV_DIR}}" timeout "{{WAL_RESTORE_TIMEOUT}}"
+      /scripts/restore_command.sh "%f" "%p"
   {{/USE_WALE}}
   authentication:
     superuser:
@@ -444,9 +448,12 @@ def get_instance_metadata(provider):
         openstack_metadata = requests.get(url, timeout=5).json()
         metadata['zone'] = openstack_metadata['availability_zone']
         if not USE_KUBERNETES:
-            # OpenStack does not support providing an IP through metadata so keep
-            # auto-discovered one.
-            metadata['id'] = openstack_metadata.uuid
+            # Try get IP via OpenStack EC2-compatible API, if can't then fail back to auto-discovered one.
+            metadata['id'] = openstack_metadata['uuid']
+            url = 'http://169.254.169.254/2009-04-04/meta-data'
+            r = requests.get(url)
+            if r.ok:
+                mapping.update({'ip': 'local-ipv4', 'id': 'instance-id'})
     else:
         logging.info("No meta-data available for this provider")
         return metadata
@@ -541,6 +548,7 @@ def get_placeholders(provider):
     placeholders.setdefault('WALE_BACKUP_THRESHOLD_MEGABYTES', 102400)
     placeholders.setdefault('WALE_BACKUP_THRESHOLD_PERCENTAGE', 30)
     placeholders.setdefault('INITDB_LOCALE', 'en_US')
+    placeholders.setdefault('CLONE_TARGET_TIMELINE', 'latest')
     # if Kubernetes is defined as a DCS, derive the namespace from the POD_NAMESPACE, if not set explicitely.
     # We only do this for Kubernetes DCS, as we don't want to suddently change, i.e. DCS base path when running
     # in Kubernetes with Etcd in a non-default namespace
@@ -550,6 +558,7 @@ def get_placeholders(provider):
     placeholders.setdefault('WAL_BUCKET_SCOPE_PREFIX', '{0}-'.format(placeholders['NAMESPACE'])
                             if placeholders['NAMESPACE'] not in ('default', '') else '')
     placeholders.setdefault('WAL_BUCKET_SCOPE_SUFFIX', '')
+    placeholders.setdefault('WAL_RESTORE_TIMEOUT', '0')
     placeholders.setdefault('WALE_ENV_DIR', os.path.join(placeholders['RW_DIR'], 'etc', 'wal-e.d', 'env'))
     placeholders.setdefault('USE_WALE', False)
     cpu_count = str(min(psutil.cpu_count(), 10))
@@ -605,6 +614,7 @@ def get_placeholders(provider):
     placeholders.setdefault('STANDBY_WITH_WALE', '')
     placeholders.setdefault('STANDBY_HOST', '')
     placeholders.setdefault('STANDBY_PORT', '')
+    placeholders.setdefault('STANDBY_PRIMARY_SLOT_NAME', '')
     placeholders.setdefault('STANDBY_CLUSTER', placeholders['STANDBY_WITH_WALE'] or placeholders['STANDBY_HOST'])
 
     if provider == PROVIDER_AWS and not USE_KUBERNETES:
@@ -640,9 +650,18 @@ def get_placeholders(provider):
         'envdir "{WALE_ENV_DIR}" {WALE_BINARY} wal-push "%p"'.format(**placeholders) \
         if placeholders['USE_WALE'] else '/bin/true'
 
-    if os.path.exists(MEMORY_LIMIT_IN_BYTES_PATH):
-        with open(MEMORY_LIMIT_IN_BYTES_PATH) as f:
+    cgroup_memory_limit_path = '/sys/fs/cgroup/memory/memory.limit_in_bytes'
+    cgroup_v2_memory_limit_path = '/sys/fs/cgroup/memory.max'
+
+    if os.path.exists(cgroup_memory_limit_path):
+        with open(cgroup_memory_limit_path) as f:
             os_memory_mb = int(f.read()) / 1048576
+    elif os.path.exists(cgroup_v2_memory_limit_path):
+        with open(cgroup_v2_memory_limit_path) as f:
+            try:
+                os_memory_mb = int(f.read()) / 1048576
+            except Exception:  # string literal "max" is a possible value
+                os_memory_mb = 0x7FFFFFFFFFF
     else:
         os_memory_mb = sys.maxsize
     os_memory_mb = min(os_memory_mb, os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / 1048576)
@@ -682,39 +701,38 @@ def pystache_render(*args, **kwargs):
 
 
 def get_dcs_config(config, placeholders):
-    if USE_KUBERNETES and placeholders.get('DCS_ENABLE_KUBERNETES_API'):
-        try:
-            kubernetes_labels = json.loads(placeholders.get('KUBERNETES_LABELS'))
-        except (TypeError, ValueError) as e:
-            logging.warning("could not parse kubernetes labels as a JSON: {0}, "
-                            "reverting to the default: {1}".format(e, KUBERNETES_DEFAULT_LABELS))
-            kubernetes_labels = json.loads(KUBERNETES_DEFAULT_LABELS)
+    # (KUBERNETES|ZOOKEEPER|EXHIBITOR|CONSUL|ETCD3|ETCD)_(HOSTS|HOST|PORT|...)
+    dcs_configs = defaultdict(dict)
+    for name, value in placeholders.items():
+        if '_' not in name:
+            continue
+        dcs, param = name.lower().split('_', 1)
+        if dcs in PATRONI_DCS:
+            if param == 'hosts':
+                if not (value.strip().startswith('-') or '[' in value):
+                    value = '[{0}]'.format(value)
+                value = yaml.safe_load(value)
+            elif param == 'discovery_domain':
+                param = 'discovery_srv'
+            dcs_configs[dcs][param] = value
 
-        config = {'kubernetes': {'role_label': placeholders.get('KUBERNETES_ROLE_LABEL'),
-                                 'scope_label': placeholders.get('KUBERNETES_SCOPE_LABEL'),
-                                 'labels': kubernetes_labels}}
-        if not placeholders.get('KUBERNETES_USE_CONFIGMAPS'):
-            config['kubernetes'].update({'use_endpoints': True, 'pod_ip': placeholders['instance_data']['ip'],
-                                         'ports': [{'port': 5432, 'name': 'postgresql'}]})
-        if str(placeholders.get('KUBERNETES_BYPASS_API_SERVICE')).lower() == 'true':
+    if USE_KUBERNETES and placeholders.get('DCS_ENABLE_KUBERNETES_API'):
+        config = {'kubernetes': dcs_configs['kubernetes']}
+        try:
+            kubernetes_labels = json.loads(config['kubernetes'].get('labels'))
+        except (TypeError, ValueError) as e:
+            logging.warning("could not parse kubernetes labels as a JSON: %r, "
+                            "reverting to the default: %s", e, KUBERNETES_DEFAULT_LABELS)
+            kubernetes_labels = json.loads(KUBERNETES_DEFAULT_LABELS)
+        config['kubernetes']['labels'] = kubernetes_labels
+
+        if not config['kubernetes'].pop('use_configmaps'):
+            config['kubernetes'].update({'use_endpoints': True, 'ports': [{'port': 5432, 'name': 'postgresql'}]})
+        if str(config['kubernetes'].pop('bypass_api_service', None)).lower() == 'true':
             config['kubernetes']['bypass_api_service'] = True
     else:
-        # (ZOOKEEPER|EXHIBITOR|CONSUL|ETCD3|ETCD)_(HOSTS|HOST|PORT|...)
-        dcs_configs = defaultdict(dict)
-        for name, value in placeholders.items():
-            if '_' not in name:
-                continue
-            dcs, param = name.lower().split('_', 1)
-            if dcs in PATRONI_DCS:
-                if param == 'hosts':
-                    if not (value.strip().startswith('-') or '[' in value):
-                        value = '[{0}]'.format(value)
-                    value = yaml.safe_load(value)
-                elif param == 'discovery_domain':
-                    param = 'discovery_srv'
-                dcs_configs[dcs][param] = value
         for dcs in PATRONI_DCS:
-            if dcs in dcs_configs:
+            if dcs != 'kubernetes' and dcs in dcs_configs:
                 config = {dcs: dcs_configs[dcs]}
                 break
         else:
@@ -752,10 +770,12 @@ def write_log_environment(placeholders):
 
 def write_wale_environment(placeholders, prefix, overwrite):
     s3_names = ['WALE_S3_PREFIX', 'WALG_S3_PREFIX', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
-                'WALE_S3_ENDPOINT', 'AWS_ENDPOINT', 'AWS_REGION', 'AWS_INSTANCE_PROFILE',
-                'WALG_S3_SSE_KMS_ID', 'WALG_S3_SSE', 'WALG_DISABLE_S3_SSE', 'AWS_S3_FORCE_PATH_STYLE']
+                'WALE_S3_ENDPOINT', 'AWS_ENDPOINT', 'AWS_REGION', 'AWS_INSTANCE_PROFILE', 'WALE_DISABLE_S3_SSE',
+                'WALG_S3_SSE_KMS_ID', 'WALG_S3_SSE', 'WALG_DISABLE_S3_SSE', 'AWS_S3_FORCE_PATH_STYLE', 'AWS_ROLE_ARN',
+                'AWS_WEB_IDENTITY_TOKEN_FILE']
     azure_names = ['WALG_AZ_PREFIX', 'AZURE_STORAGE_ACCOUNT', 'AZURE_STORAGE_ACCESS_KEY',
-                   'AZURE_STORAGE_SAS_TOKEN', 'WALG_AZURE_BUFFER_SIZE', 'WALG_AZURE_MAX_BUFFERS']
+                   'AZURE_STORAGE_SAS_TOKEN', 'WALG_AZURE_BUFFER_SIZE', 'WALG_AZURE_MAX_BUFFERS',
+                   'AZURE_ENVIRONMENT_NAME']
     gs_names = ['WALE_GS_PREFIX', 'WALG_GS_PREFIX', 'GOOGLE_APPLICATION_CREDENTIALS']
     swift_names = ['WALE_SWIFT_PREFIX', 'SWIFT_AUTHURL', 'SWIFT_TENANT', 'SWIFT_TENANT_ID', 'SWIFT_USER',
                    'SWIFT_USER_ID', 'SWIFT_USER_DOMAIN_NAME', 'SWIFT_USER_DOMAIN_ID', 'SWIFT_PASSWORD',
@@ -767,8 +787,9 @@ def write_wale_environment(placeholders, prefix, overwrite):
                   'WALG_NETWORK_RATE_LIMIT', 'WALG_COMPRESSION_METHOD', 'USE_WALG_BACKUP',
                   'USE_WALG_RESTORE', 'WALG_BACKUP_COMPRESSION_METHOD', 'WALG_BACKUP_FROM_REPLICA',
                   'WALG_SENTINEL_USER_DATA', 'WALG_PREVENT_WAL_OVERWRITE', 'WALG_S3_CA_CERT_FILE',
-                  'WALG_LIBSODIUM_KEY', 'WALG_LIBSODIUM_KEY_PATH', 'WALG_PGP_KEY', 'WALG_PGP_KEY_PATH',
-                  'WALG_PGP_KEY_PASSPHRASE']
+                  'WALG_LIBSODIUM_KEY', 'WALG_LIBSODIUM_KEY_PATH', 'WALG_LIBSODIUM_KEY_TRANSFORM',
+                  'WALG_PGP_KEY', 'WALG_PGP_KEY_PATH', 'WALG_PGP_KEY_PASSPHRASE',
+                  'no_proxy', 'http_proxy', 'https_proxy']
 
     wale = defaultdict(lambda: '')
     for name in ['PGVERSION', 'PGPORT', 'WALE_ENV_DIR', 'SCOPE', 'WAL_BUCKET_SCOPE_PREFIX', 'WAL_BUCKET_SCOPE_SUFFIX',
@@ -783,11 +804,23 @@ def write_wale_environment(placeholders, prefix, overwrite):
 
         # for S3-compatible storage we want to specify WALE_S3_ENDPOINT and AWS_ENDPOINT, but not AWS_REGION
         if aws_endpoint or wale_endpoint:
-            if not aws_endpoint:
-                aws_endpoint = wale_endpoint.replace('+path://', '://')
-            elif not wale_endpoint:
+            convention = 'path'
+            if not wale_endpoint:
                 wale_endpoint = aws_endpoint.replace('://', '+path://')
-            wale.update(WALE_S3_ENDPOINT=wale_endpoint, AWS_ENDPOINT=aws_endpoint, WALG_DISABLE_S3_SSE='true')
+            else:
+                match = re.match(r'^(\w+)\+(\w+)(://.+)$', wale_endpoint)
+                if match:
+                    convention = match.group(2)
+                else:
+                    logging.warning('Invalid WALE_S3_ENDPOINT, the format is protocol+convention://hostname:port, '
+                                    'but got %s', wale_endpoint)
+                if not aws_endpoint:
+                    aws_endpoint = match.expand(r'\1\3') if match else wale_endpoint
+            wale.update(WALE_S3_ENDPOINT=wale_endpoint, AWS_ENDPOINT=aws_endpoint)
+            for name in ('WALE_DISABLE_S3_SSE', 'WALG_DISABLE_S3_SSE'):
+                if not wale.get(name):
+                    wale[name] = 'true'
+            wale['AWS_S3_FORCE_PATH_STYLE'] = 'true' if convention == 'path' else 'false'
             if aws_region and wale.get('USE_WALG_BACKUP') == 'true':
                 wale['AWS_REGION'] = aws_region
         elif not aws_region:
@@ -804,6 +837,10 @@ def write_wale_environment(placeholders, prefix, overwrite):
 
         if not (wale.get('AWS_SECRET_ACCESS_KEY') and wale.get('AWS_ACCESS_KEY_ID')):
             wale['AWS_INSTANCE_PROFILE'] = 'true'
+
+        if wale.get('WALE_DISABLE_S3_SSE') and not wale.get('WALG_DISABLE_S3_SSE'):
+            wale['WALG_DISABLE_S3_SSE'] = wale['WALE_DISABLE_S3_SSE']
+
         if wale.get('USE_WALG_BACKUP') and wale.get('WALG_DISABLE_S3_SSE') != 'true' and not wale.get('WALG_S3_SSE'):
             wale['WALG_S3_SSE'] = 'AES256'
         write_envdir_names = s3_names + walg_names
@@ -1001,7 +1038,7 @@ def main():
     user_config_copy = deepcopy(user_config)
     config = deep_update(user_config_copy, config)
 
-    if provider == PROVIDER_LOCAL and not any(1 for key in config.keys() if key == 'kubernetes' or key in PATRONI_DCS):
+    if provider == PROVIDER_LOCAL and not any(1 for key in config.keys() if key in PATRONI_DCS):
         link_runit_service(placeholders, 'etcd')
         config['etcd'] = {'host': '127.0.0.1:2379'}
 
@@ -1025,10 +1062,10 @@ def main():
     version = float(placeholders['PGVERSION'])
     if 'shared_preload_libraries' not in user_config.get('postgresql', {}).get('parameters', {}):
         config['postgresql']['parameters']['shared_preload_libraries'] =\
-                append_extentions(config['postgresql']['parameters']['shared_preload_libraries'], version)
+                append_extensions(config['postgresql']['parameters']['shared_preload_libraries'], version)
     if 'extwlist.extensions' not in user_config.get('postgresql', {}).get('parameters', {}):
         config['postgresql']['parameters']['extwlist.extensions'] =\
-                append_extentions(config['postgresql']['parameters']['extwlist.extensions'], version, True)
+                append_extensions(config['postgresql']['parameters']['extwlist.extensions'], version, True)
 
     # Ensure replication is available
     if 'pg_hba' in config['bootstrap'] and not any(['replication' in i for i in config['bootstrap']['pg_hba']]):
@@ -1047,27 +1084,6 @@ def main():
                 os.makedirs(pg_socket_dir)
                 os.chmod(pg_socket_dir, 0o2775)
                 adjust_owner(pg_socket_dir)
-
-            # It is a recurring and very annoying problem with crashes (host/pod/container)
-            # while the backup is taken in the exclusive mode which leaves the backup_label
-            # in the PGDATA. Having the backup_label file in the PGDATA makes postgres think
-            # that we are restoring from the backup and it puts this information into the
-            # pg_control. Effectively it makes it impossible to start postgres in recovery
-            # with such PGDATA because the recovery never-ever-ever-ever finishes.
-            #
-            # As a workaround we will remove the backup_label file from PGDATA if we know
-            # for sure that the Postgres was already running with exactly this PGDATA.
-            # As proof that the postgres was running we will use the presence of postmaster.pid
-            # in the PGDATA, because it is 100% known that neither pg_basebackup nor
-            # wal-e/wal-g are backing up/restoring this file.
-            #
-            # We are not doing such trick in the Patroni (removing backup_label) because
-            # we have absolutely no idea what software people use for backup/recovery.
-            # In case of some home-grown solution they might end up in copying postmaster.pid...
-            postmaster_pid = os.path.join(pgdata, 'postmaster.pid')
-            backup_label = os.path.join(pgdata, 'backup_label')
-            if os.path.isfile(postmaster_pid) and os.path.isfile(backup_label):
-                os.unlink(backup_label)
         elif section == 'pgqd':
             link_runit_service(placeholders, 'pgqd')
         elif section == 'log':
