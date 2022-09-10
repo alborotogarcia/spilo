@@ -355,7 +355,7 @@ ENV PATRONIVERSION=2.1.4
 ENV WALE_VERSION=1.1.1
 ENV WALG_VERSION=v2.0.1
 RUN export DEBIAN_FRONTEND=noninteractive \
-    && set -ex && apt-get update && apt-get install -y software-properties-common && add-apt-repository -y ppa:longsleep/golang-backports \
+    && set -ex && apt-get update && apt-get install -y software-properties-common wget && add-apt-repository -y ppa:longsleep/golang-backports \
     && BUILD_PACKAGES="python3-pip python3-wheel python3-dev git patchutils binutils liblzo2-dev make golang-go cmake gcc libc6-dev" \
     && apt-get update \
 \
@@ -377,13 +377,10 @@ RUN export DEBIAN_FRONTEND=noninteractive \
 \
         && find /usr/share/python-babel-localedata/locale-data -type f ! -name 'en_US*.dat' -delete \
 \
-        && pip3 install filechunkio wal-e[aws,google,swift]==$WALE_VERSION google-crc32c==1.1.2 'protobuf<4.21.0' \ \
+        && pip3 install filechunkio google-crc32c==1.1.2 'protobuf<4.21.0' \
                 'git+https://github.com/zalando-pg/wal-e.git#egg=wal-e[aws,google,swift]' \
                 'git+https://github.com/zalando/pg_view.git@master#egg=pg-view' \
 \
-        # Revert https://github.com/wal-e/wal-e/commit/485d834a18c9b0d97115d95f89e16bdc564e9a18, it affects S3 performance
-        && curl -sL https://github.com/wal-e/wal-e/commit/485d834a18c9b0d97115d95f89e16bdc564e9a18.diff \
-                | patch -d /usr/local/lib/python3.8/dist-packages/wal_e -Rp2 \
         # https://github.com/wal-e/wal-e/issues/318
         && sed -i 's/^\(    for i in range(0,\) num_retries):.*/\1 100):/g' \
                     /usr/lib/python3/dist-packages/boto/utils.py; \
