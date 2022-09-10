@@ -31,7 +31,7 @@ def patch_wale_prefix(value, new_version):
 
 
 def update_configs(new_version):
-    from spilo_commons import append_extentions, get_bin_dir, get_patroni_config, write_file, write_patroni_config
+    from spilo_commons import append_extensions, get_bin_dir, get_patroni_config, write_file, write_patroni_config
 
     config = get_patroni_config()
 
@@ -41,18 +41,18 @@ def update_configs(new_version):
     shared_preload_libraries = config['postgresql'].get('parameters', {}).get('shared_preload_libraries')
     if shared_preload_libraries is not None:
         config['postgresql']['parameters']['shared_preload_libraries'] =\
-                append_extentions(shared_preload_libraries, version)
+                append_extensions(shared_preload_libraries, version)
 
     extwlist_extensions = config['postgresql'].get('parameters', {}).get('extwlist.extensions')
     if extwlist_extensions is not None:
         config['postgresql']['parameters']['extwlist.extensions'] =\
-                append_extentions(extwlist_extensions, version, True)
+                append_extensions(extwlist_extensions, version, True)
 
     write_patroni_config(config, True)
 
     # update wal-e/wal-g envdir files
     restore_command = shlex.split(config['postgresql'].get('recovery_conf', {}).get('restore_command', ''))
-    if len(restore_command) > 4 and restore_command[0] == 'envdir':
+    if len(restore_command) > 6 and restore_command[0] == 'envdir':
         envdir = restore_command[1]
 
         try:
@@ -103,7 +103,8 @@ class InplaceUpgrade(object):
         self.rsyncd_started = False
 
         if self.upgrade_required:
-            self.dcs = get_dcs(config)
+            # we want to reduce tcp timeouts and keepalives and therefore tune loop_wait, retry_timeout, and ttl
+            self.dcs = get_dcs({**config.copy(), 'loop_wait': 0, 'ttl': 10, 'retry_timeout': 10, 'patronictl': True})
             self.request = PatroniRequest(config, True)
 
     @staticmethod
@@ -417,7 +418,7 @@ hosts deny = *
         conn_kwargs = self.postgresql.local_conn_kwargs
 
         for d in self.postgresql.query('SELECT datname FROM pg_catalog.pg_database WHERE datallowconn'):
-            conn_kwargs['database'] = d[0]
+            conn_kwargs['dbname'] = d[0]
             with get_connection_cursor(**conn_kwargs) as cur:
                 cur.execute('SELECT attrelid::regclass, quote_ident(attname), attstattarget '
                             'FROM pg_catalog.pg_attribute WHERE attnum > 0 AND NOT attisdropped AND attstattarget > 0')
@@ -437,7 +438,7 @@ hosts deny = *
 
         logger.info('Restoring default statistics targets after upgrade')
         for db, val in self._statistics.items():
-            conn_kwargs['database'] = db
+            conn_kwargs['dbname'] = db
             with get_connection_cursor(**conn_kwargs) as cur:
                 for table, val in val.items():
                     for column, target in val.items():
@@ -457,7 +458,7 @@ hosts deny = *
         conn_kwargs = self.postgresql.local_conn_kwargs
 
         for db, val in self._statistics.items():
-            conn_kwargs['database'] = db
+            conn_kwargs['dbname'] = db
             with get_connection_cursor(**conn_kwargs) as cur:
                 for table in val.keys():
                     query = 'ANALYZE {0}'.format(table)
@@ -612,6 +613,11 @@ hosts deny = *
             logger.error('Failed to start primary after upgrade')
 
         logger.info('Upgrade downtime: %s', time.time() - downtime_start)
+
+        # The last attempt to fix initialize key race condition
+        cluster = self.dcs.get_cluster()
+        if cluster.initialize == self._old_sysid:
+            self.dcs.cancel_initialization()
 
         try:
             self.postgresql.update_extensions()

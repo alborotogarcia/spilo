@@ -73,7 +73,7 @@ class _PostgresqlUpgrade(Postgresql):
         conn_kwargs = self.local_conn_kwargs
 
         for d in self._get_all_databases():
-            conn_kwargs['database'] = d
+            conn_kwargs['dbname'] = d
             with get_connection_cursor(**conn_kwargs) as cur:
                 for ext in self._INCOMPATIBLE_EXTENSIONS:
                     logger.info('Executing "DROP EXTENSION IF EXISTS %s" in the database="%s"', ext, d)
@@ -86,7 +86,7 @@ class _PostgresqlUpgrade(Postgresql):
         conn_kwargs = self.local_conn_kwargs
 
         for d in self._get_all_databases():
-            conn_kwargs['database'] = d
+            conn_kwargs['dbname'] = d
             with get_connection_cursor(**conn_kwargs) as cur:
 
                 cmd = "REVOKE EXECUTE ON FUNCTION pg_catalog.pg_switch_{0}() FROM admin".format(self.wal_name)
@@ -115,7 +115,7 @@ class _PostgresqlUpgrade(Postgresql):
         conn_kwargs = self.local_conn_kwargs
 
         for d in self._get_all_databases():
-            conn_kwargs['database'] = d
+            conn_kwargs['dbname'] = d
             with get_connection_cursor(**conn_kwargs) as cur:
                 cur.execute('SELECT quote_ident(extname) FROM pg_catalog.pg_extension')
                 for extname in cur.fetchall():
@@ -186,7 +186,7 @@ class _PostgresqlUpgrade(Postgresql):
             return True
 
     def prepare_new_pgdata(self, version):
-        from spilo_commons import append_extentions
+        from spilo_commons import append_extensions
 
         locale = self.query('SHOW lc_collate').fetchone()[0]
         encoding = self.query('SHOW server_encoding').fetchone()[0]
@@ -222,7 +222,7 @@ class _PostgresqlUpgrade(Postgresql):
         shared_preload_libraries = self.config.get('parameters').get('shared_preload_libraries')
         if shared_preload_libraries:
             self._old_shared_preload_libraries = self.config.get('parameters')['shared_preload_libraries'] =\
-                append_extentions(shared_preload_libraries, float(version))
+                append_extensions(shared_preload_libraries, float(version))
             self.no_bg_mon()
 
         if not self.bootstrap._initdb(initdb_config):

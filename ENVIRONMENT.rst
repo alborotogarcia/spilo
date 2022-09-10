@@ -12,6 +12,7 @@ Environment Configuration Settings
 - **PGHOME**: filesystem path where to put PostgreSQL home directory (/home/postgres by default)
 - **APIPORT**: TCP port to Patroni API connections (8008 by default)
 - **BACKUP_SCHEDULE**: cron schedule for doing backups via WAL-E (if WAL-E is enabled, '00 01 * * *' by default)
+- **CLONE_TARGET_TIMELINE**: timeline id of the backup for restore, 'latest' by default.
 - **CRONTAB**: anything that you want to run periodically as a cron job (empty by default)
 - **PGROOT**: a directory where we put the pgdata (by default /home/postgres/pgroot). One may adjust it to point to the mount point of the persistent volume, such as EBS.
 - **WALE_TMPDIR**: directory to store WAL-E temporary files. PGROOT/../tmp by default, make sure it has a few GBs of free space.
@@ -46,7 +47,8 @@ Environment Configuration Settings
 - **WALE_BACKUP_THRESHOLD_MEGABYTES**: maximum size of the WAL segments accumulated after the base backup to consider WAL-E restore instead of pg_basebackup.
 - **WALE_BACKUP_THRESHOLD_PERCENTAGE**: maximum ratio (in percents) of the accumulated WAL files to the base backup to consider WAL-E restore instead of pg_basebackup.
 - **WALE_ENV_DIR**: directory where to store WAL-E environment variables
-- **WAL_S3_BUCKET**: (optional) path to the S3 bucket used for WAL-E base backups (i.e. s3://foobar). Spilo will add /spilo/scope/wal to that path.
+- **WAL_RESTORE_TIMEOUT**: timeout (in seconds) for restoring a single WAL file (at most 16 MB) from the backup location, 0 by default. A duration of 0 disables the timeout.
+- **WAL_S3_BUCKET**: (optional) name of the S3 bucket used for WAL-E base backups.
 - **AWS_ACCESS_KEY_ID**: (optional) aws access key
 - **AWS_SECRET_ACCESS_KEY**: (optional) aws secret key
 - **AWS_REGION**: (optional) region of S3 bucket
@@ -76,6 +78,7 @@ Environment Configuration Settings
 - **SWIFT_PROJECT_DOMAIN_ID**:
 - **WALE_SWIFT_PREFIX**: (optional) the full path to the backup location on the Swift Storage in the format swift://bucket-name/very/long/path. If not specified Spilo will generate it from WAL_SWIFT_BUCKET.
 - **SSH_USERNAME**: (optional) the username for WAL backups.
+- **SSH_PORT**: (optional) the ssh port for WAL backups.
 - **SSH_PRIVATE_KEY_PATH**: (optional) the path to the private key used for WAL backups.
 - **AZURE_STORAGE_ACCOUNT**:(optional) the azure storage account to use for WAL backups.
 - **AZURE_STORAGE_ACCESS_KEY**:(optional) the access key for the azure storage account used for WAL backups.
@@ -91,6 +94,7 @@ Environment Configuration Settings
 - **KUBERNETES_LABELS**: a JSON describing names and values of other labels used by Patroni on Kubernetes to locate its metadata. Default is '{"application": "spilo"}'.
 - **INITDB_LOCALE**: database cluster's default UTF-8 locale (en_US by default)
 - **ENABLE_WAL_PATH_COMPAT**: old Spilo images were generating wal path in the backup store using the following template ``/spilo/{WAL_BUCKET_SCOPE_PREFIX}{SCOPE}{WAL_BUCKET_SCOPE_SUFFIX}/wal/``, while new images adding one additional directory (``{PGVERSION}``) to the end. In order to avoid (unlikely) issues with restoring WALs (from S3/GC/and so on) when switching to ``spilo-13`` please set the ``ENABLE_WAL_PATH_COMPAT=true`` when deploying old cluster with ``spilo-13`` for the first time. After that the environment variable could be removed. Change of the WAL path also mean that backups stored in the old location will not be cleaned up automatically.
+- **WALE_DISABLE_S3_SSE**, **WALG_DISABLE_S3_SSE**: by default wal-e/wal-g are configured to encrypt files uploaded to S3. In order to disable it you can set this environment variable to ``true``.
 
 wal-g
 -----
@@ -104,7 +108,9 @@ In case of S3, `wal-e` is used for backups and `wal-g` for restore.
 - **WALG_DELTA_MAX_STEPS**, **WALG_DELTA_ORIGIN**, **WALG_DOWNLOAD_CONCURRENCY**, **WALG_UPLOAD_CONCURRENCY**, **WALG_UPLOAD_DISK_CONCURRENCY**, **WALG_DISK_RATE_LIMIT**, **WALG_NETWORK_RATE_LIMIT**, **WALG_COMPRESSION_METHOD**, **WALG_BACKUP_COMPRESSION_METHOD**, **WALG_BACKUP_FROM_REPLICA**, **WALG_SENTINEL_USER_DATA**, **WALG_PREVENT_WAL_OVERWRITE**: (optional) configuration options for wal-g.
 - **WALG_S3_CA_CERT_FILE**: (optional) TLS CA certificate for wal-g (see [wal-g configuration](https://github.com/wal-g/wal-g#configuration))
 - **WALG_SSH_PREFIX**: (optional) the ssh prefix to store WAL backups at in the format ssh://host.example.com/path/to/backups/ See `Wal-g <https://github.com/wal-g/wal-g#configuration>`__ documentation for details.
-- **'WALG_LIBSODIUM_KEY**, **WALG_LIBSODIUM_KEY_PATH**, **WALG_PGP_KEY**, **WALG_PGP_KEY_PATH**, **WALG_PGP_KEY_PASSPHRASE** (optional) wal-g encryption properties (see [wal-g encryption](https://github.com/wal-g/wal-g#encryption))
+- **WALG_LIBSODIUM_KEY**, **WALG_LIBSODIUM_KEY_PATH**, **WALG_LIBSODIUM_KEY_TRANSFORM**, **WALG_PGP_KEY**, **WALG_PGP_KEY_PATH**, **WALG_PGP_KEY_PASSPHRASE** (optional) wal-g encryption properties (see [wal-g encryption](https://github.com/wal-g/wal-g#encryption))
+- **http_proxy**, **https_proxy**, **no_proxy** (optional) HTTP(S) proxy configuration for `wal-g` to access S3. While http_proxy and https_proxy take a proxy URL, no_proxy takes a comma separated list of exceptions. Both are following a de-facto standard, see the [`wget`](https://www.gnu.org/software/wget/manual/html_node/Proxies.html) documentation.
+
 
 Azure Specific WAL-G Configuration
 `````
@@ -117,3 +123,4 @@ For more inforamation on the Azure specific options, refer to https://github.com
 - **AZURE_STORAGE_SAS_TOKEN**
 - **WALG_AZURE_BUFFER_SIZE**
 - **WALG_AZURE_MAX_BUFFERS**
+- **AZURE_ENVIRONMENT_NAME**
